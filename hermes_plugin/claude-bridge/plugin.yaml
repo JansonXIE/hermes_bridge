@@ -1,0 +1,10 @@
+name: claude-bridge
+version: "0.1.0"
+description: Dispatch and supervise multiple Claude Code workers through the async task bridge
+provides_tools:
+  - claude_task_start
+  - claude_task_get
+  - claude_task_list
+  - claude_task_cancel
+provides_hooks:
+  - pre_llm_call

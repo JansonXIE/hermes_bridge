@@ -1,0 +1,20 @@
+# systemd user template: <name>@api, <name>@worker, <name>@adapter
+# deploy/setup.sh fills in @CODE_DIR@, @BRIDGE_HOME@ and @PYTHON@ and installs it to
+# ~/.config/systemd/user/. To install by hand, substitute them yourself.
+[Unit]
+Description=Hermes bridge %i (@BRIDGE_HOME@)
+After=network.target
+
+[Service]
+WorkingDirectory=@CODE_DIR@
+EnvironmentFile=@BRIDGE_HOME@/bridge.env
+ExecStart=@PYTHON@ -m hermes_bridge -c @BRIDGE_HOME@/bridge.toml %i
+Restart=always
+RestartSec=2
+# Claude keeps running across a worker restart and is adopted by the next worker.
+# The default control-group mode would kill it together with the worker.
+KillMode=process
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+[project]
+name = "hermes-bridge"
+version = "0.1.0"
+description = "Async task bridge that lets Hermes Agent dispatch and supervise multiple Claude Code processes"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+hermes-bridge = "hermes_bridge.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hermes_bridge"]

@@ -1,0 +1,74 @@
+# Copy to bridge.toml and adapt. Prefer *_env keys so that secrets stay out of this file.
+data_dir = "data"              # relative paths are resolved against this file
+
+[api]
+host = "127.0.0.1"
+port = 8765
+
+[[api.tokens]]
+name = "hermes"                # task owner; tasks are visible only to the token that created them
+token_env = "BRIDGE_API_TOKEN"
+projects = ["backend-api"]     # or ["*"]
+
+[worker]
+max_concurrency = 3            # global limit across all projects; adjust to machine and quota
+lease_seconds = 30
+term_grace_seconds = 10        # SIGTERM to SIGKILL
+default_timeout_seconds = 1800
+max_timeout_seconds = 14400
+max_attempts = 2               # only applies to tasks submitted with safe_to_retry = true
+silence_alert_seconds = 600    # raises an alert; does not stop the task
+event_retention_days = 14
+port_base = 21000              # each slot gets BRIDGE_PORT_BASE .. + port_block
+port_block = 100
+
+[claude]
+command = ["claude"]
+include_partial_messages = true
+# extra_args = []
+# append_system_prompt = "..."
+# env_passthrough = [...]      # glob allowlist of variables passed to Claude; see config.py
+
+[notify]
+url = "http://127.0.0.1:8766/v1/events"   # fixed here: requests cannot choose a callback address
+secret_env = "BRIDGE_NOTIFY_SECRET"
+max_attempts = 12              # afterwards: `hermes-bridge dead-letters`
+base_backoff = 2
+max_backoff = 300
+
+[adapter]
+host = "127.0.0.1"
+port = 8766
+token_env = "BRIDGE_ADAPTER_TOKEN"
+coalesce_seconds = 3           # completions this close together wake the session once
+lease_seconds = 60
+max_attempts = 10
+# Optional: wake sessions that no live Hermes claimed in time (for example a CLI that has exited).
+# fallback_command = ["hermes", "chat", "--resume", "{session_id}", "-Q", "-q", "{prompt}", "--source", "tool"]
+# fallback_after_seconds = 120
+
+[projects.backend-api]
+path = "/path/to/repo"         # only configured projects can be reached
+isolation = "worktree"         # or "directory" for an empty per-task directory, or "inplace" (see below)
+base_ref = "HEAD"
+permission_mode = "dontAsk"    # anything not allowed below is denied and listed in result.permission_denials
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(pytest *)", "Bash(git status*)", "Bash(git diff*)"]
+# disallowed_tools = []
+# model = "sonnet"
+# effort = "high"
+max_budget_usd = 5.0           # default for the project and upper limit for per-task overrides
+verify_command = ["pytest", "-q"]   # acceptance check run by the worker after Claude succeeds
+verify_timeout_seconds = 900
+auto_commit = true             # snapshot leftovers onto bridge/<task_id>; repository hooks still apply
+# commit_message = "..."       # {action} and {task_id} are substituted
+
+# [projects.backend-api.env]
+# DATABASE_URL = "sqlite:///./test.db"
+
+# Read-only tasks in a live directory that is not a single git repository (for example a `repo`
+# workspace). Claude runs in `path` itself: only Read, Glob and Grep may be allowed, Edit, Write,
+# NotebookEdit and Bash are always denied, no verify_command, and gc never deletes it.
+# [projects.whole-tree]
+# path = "/path/to/workspace"
+# isolation = "inplace"
+# allowed_tools = ["Read", "Glob", "Grep"]
