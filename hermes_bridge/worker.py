@@ -576,8 +576,10 @@ class Worker:
         self.runners = [r for r in self.runners if r.is_alive()]
         self._recover_expired(now)
         self.store.block_failed_dependents()
+        exclusive = frozenset(p.id for p in self.config.projects.values() if p.exclusive)
         while not self.shutting_down.is_set():
-            claimed = self.store.claim_next(self.worker_id, self.config.lease_seconds, self.config.max_concurrency)
+            claimed = self.store.claim_next(self.worker_id, self.config.lease_seconds, self.config.max_concurrency,
+                                            exclusive)
             if claimed is None:
                 break
             self._launch(*claimed)

@@ -335,22 +335,32 @@ class Store:
         acceptance = json.loads(row["acceptance"]) if row["acceptance"] else {}
         return acceptance.get("status") != "failed"
 
-    def claim_next(self, worker_id: str, lease_seconds: float, max_concurrency: int) -> Optional[tuple[dict, dict]]:
-        """Atomically move the oldest runnable queued task to `starting`, respecting global limits."""
+    def claim_next(self, worker_id: str, lease_seconds: float, max_concurrency: int,
+                   exclusive_projects: frozenset[str] = frozenset()) -> Optional[tuple[dict, dict]]:
+        """Atomically move the oldest runnable queued task to `starting`, respecting global limits.
+
+        Projects in `exclusive_projects` run at most one task at a time."""
         now = time.time()
         with self.tx() as c:
             active = c.execute(f"SELECT id, slot FROM tasks WHERE status IN ({_ACTIVE_SQL})").fetchall()
             if len(active) >= max_concurrency:
                 return None
             for task in c.execute("SELECT * FROM tasks WHERE status=? ORDER BY seq LIMIT 200", (QUEUED,)).fetchall():
-                if self._runnable(c, task):
+                if self._runnable(c, task, exclusive_projects):
                     return self._claim(c, task, worker_id, lease_seconds, {r["slot"] for r in active}, now)
         return None
 
-    def _runnable(self, c: sqlite3.Connection, task: sqlite3.Row) -> bool:
+    def _runnable(self, c: sqlite3.Connection, task: sqlite3.Row, exclusive_projects: frozenset[str] = frozenset()) -> bool:
         for dep in json.loads(task["depends_on"]):
             row = c.execute("SELECT status, acceptance FROM tasks WHERE id=?", (dep,)).fetchone()
             if not row or not self._dependency_satisfied(row):
+                return False
+        if task["project_id"] in exclusive_projects:
+            busy = c.execute(
+                f"SELECT 1 FROM tasks WHERE project_id=? AND status IN ({_ACTIVE_SQL}) LIMIT 1",
+                (task["project_id"],),
+            ).fetchone()
+            if busy:
                 return False
         if task["kind"] == "integration":
             # Merges into a project run strictly one at a time.

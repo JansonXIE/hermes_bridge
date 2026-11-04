@@ -559,6 +559,63 @@ FAKE_CLAUDE_LEDGER = "{self.ledger}"
                 load_config(path)
 
 
+class WritableInPlace(BridgeCase):
+    def _config(self):
+        config = super()._config().replace('projects = ["demo", "scratch"]', 'projects = ["demo", "scratch", "sdk"]')
+        return config + f"""
+[projects.sdk]
+path = "{self.tmp / 'sdk'}"
+isolation = "inplace"
+allow_inplace_writes = true
+permission_mode = "bypassPermissions"
+allow_bypass_permissions = true
+[projects.sdk.env]
+FAKE_CLAUDE_LEDGER = "{self.ledger}"
+"""
+
+    def setUp(self):
+        super().setUp()
+        (self.tmp / "sdk").mkdir()
+
+    def test_writes_in_the_live_directory_one_task_at_a_time(self):
+        live = self.tmp / "sdk"
+        ids = [self.submit(f"SLEEP=1\nWRITE=out-{i}.txt", project="sdk") for i in range(2)]
+        other = self.submit("SLEEP=1", project="scratch")
+
+        peak = 0
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            states = [self.task(i)["status"] for i in ids]
+            peak = max(peak, sum(s in ("starting", "running") for s in states))
+            if all(s == "succeeded" for s in states):
+                break
+            time.sleep(0.03)
+        self.assertEqual(peak, 1, "tasks of a writable inplace project never overlap")
+        self.wait_status(other, "succeeded")
+        self.assertEqual(sorted(os.listdir(live)), ["out-0.txt", "out-1.txt"])
+        for task_id in ids:
+            final = self.task(task_id)
+            self.assertEqual(final["artifacts"]["workdir"], str(live))
+            self.assertIsNone(final["changes"])
+            argv = self.runs_of(task_id)[0]["argv"]
+            self.assertEqual(argv[argv.index("--permission-mode") + 1], "bypassPermissions")
+            self.assertNotIn("--disallowedTools", argv)
+
+    def test_opt_in_is_explicit(self):
+        from hermes_bridge.config import ConfigError, load_config
+        base = self.config_path.read_text()
+        for old, new in (
+            ("allow_inplace_writes = true", 'allow_inplace_writes = "yes"'),
+            ('isolation = "inplace"\n', 'isolation = "worktree"\n'),
+            ("allow_inplace_writes = true", 'allow_inplace_writes = true\nverify_command = ["make"]'),
+            ("allow_inplace_writes = true\n", ""),
+        ):
+            path = self.tmp / "bad.toml"
+            path.write_text(base.replace(old, new))
+            with self.subTest(new=new), self.assertRaises(ConfigError):
+                load_config(path)
+
+
 class Continuation(BridgeCase):
     def test_follow_up_resumes_the_same_session_and_worktree(self):
         first = self.submit("WRITE=one.txt")

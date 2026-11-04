@@ -72,3 +72,7 @@ auto_commit = true             # snapshot leftovers onto bridge/<task_id>; repos
 # path = "/path/to/workspace"
 # isolation = "inplace"
 # allowed_tools = ["Read", "Glob", "Grep"]
+# To let tasks edit and build in that live directory instead (no snapshot, one task at a time):
+# allow_inplace_writes = true
+# permission_mode = "bypassPermissions"
+# allow_bypass_permissions = true

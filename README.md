@@ -119,7 +119,7 @@ Hermes 由此获得 `claude_task_start`、`claude_task_get`、`claude_task_list`
 - `kind: "integration"`：同项目串行运行，由 Claude 合并依赖分支并处理冲突，结束后 Worker 重新运行 `verify_command`。不会自动合入主分支。
 - `continue_task_id`：用 `--resume` 向已结束任务的同一 Claude 会话和 worktree 发后续指令；同一会话不会有两个进程同时写入。
 - `safe_to_retry`：默认 `false`。只有声明为 `true` 的任务，才会在进程丢失后自动重跑。
-- `isolation = "inplace"`：项目不是单个 git 仓库（如 repo 工作区）时，只读任务直接在 `path` 中运行。只能允许 Read、Glob、Grep，始终禁止 Edit、Write、NotebookEdit、Bash，不能配置 `verify_command`，`gc` 不会回收该目录。
+- `isolation = "inplace"`：项目不是单个 git 仓库（如 repo 工作区）时，只读任务直接在 `path` 中运行。只能允许 Read、Glob、Grep，始终禁止 Edit、Write、NotebookEdit、Bash，不能配置 `verify_command`，`gc` 不会回收该目录。显式设置 `allow_inplace_writes = true` 后取消上述工具限制，可配合 `bypassPermissions` 直接修改和编译该目录；此时同一项目的任务串行运行，不做快照提交，`changes` 为空。
 
 **重启恢复：** Claude 在独立会话中运行，输出写文件，所以 Worker 崩溃或重启不影响它。新 Worker 用 pid、启动时间和 boot id 核对进程身份后接管，从保存的偏移量继续读日志，事件不丢不重。旧 Worker 的写入会被租约令牌拒绝。进程已消失时，若日志里有最终结果就按结果结束，否则标记 `process_lost`，由 Hermes 决定是否重跑。
 

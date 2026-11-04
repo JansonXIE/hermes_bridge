@@ -1,0 +1,24 @@
+# Python 字节码缓存
+__pycache__/
+*.py[cod]
+
+# 打包/构建产物
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 测试 / 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# 本地生成的配置、密钥和数据（init / setup.sh 生成，不入库）
+bridge.toml
+bridge.env
+.env
+data/

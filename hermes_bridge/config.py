@@ -72,6 +72,12 @@ class Project:
     auto_commit: bool = True
     commit_message: str = DEFAULT_COMMIT_MESSAGE
     env: dict[str, str] = field(default_factory=dict)
+    allow_inplace_writes: bool = False
+
+    @property
+    def exclusive(self) -> bool:
+        """Tasks write to a directory shared by every task of the project, so run one at a time."""
+        return self.isolation == "inplace" and self.allow_inplace_writes
 
 
 @dataclass(frozen=True)
@@ -166,15 +172,21 @@ def _project(project_id: str, raw: dict, base: Path) -> Project:
             f"{where}: bypassPermissions requires allow_bypass_permissions = true and a real sandbox"
         )
     disallowed = tuple(raw.get("disallowed_tools", ()))
-    if isolation == "inplace":
-        # Claude runs in the live checkout, shared by all tasks: reading only.
+    writes = raw.get("allow_inplace_writes", False)
+    if not isinstance(writes, bool):
+        raise ConfigError(f"{where}: allow_inplace_writes must be true or false")
+    if writes and isolation != "inplace":
+        raise ConfigError(f"{where}: allow_inplace_writes only applies to inplace isolation")
+    if isolation == "inplace" and raw.get("verify_command"):
+        raise ConfigError(f"{where}: inplace isolation cannot run a verify_command")
+    if isolation == "inplace" and not writes:
+        # Claude runs in the live checkout, shared by all tasks: reading only, unless explicitly
+        # opted in, in which case the project's tasks run one at a time and nothing is snapshotted.
         if mode != "dontAsk":
             raise ConfigError(f"{where}: inplace isolation requires permission_mode = 'dontAsk'")
         extra = set(raw.get("allowed_tools", ())) - set(INPLACE_ALLOWED_TOOLS)
         if extra:
             raise ConfigError(f"{where}: inplace isolation only allows {list(INPLACE_ALLOWED_TOOLS)}, not {sorted(extra)}")
-        if raw.get("verify_command"):
-            raise ConfigError(f"{where}: inplace isolation cannot run a verify_command")
         # Deny rules also override allow rules from the user's own Claude settings.
         disallowed += tuple(t for t in INPLACE_DENIED_TOOLS if t not in disallowed)
     return Project(
@@ -193,6 +205,7 @@ def _project(project_id: str, raw: dict, base: Path) -> Project:
         auto_commit=bool(raw.get("auto_commit", True)),
         commit_message=raw.get("commit_message", DEFAULT_COMMIT_MESSAGE),
         env=dict(raw.get("env", {})),
+        allow_inplace_writes=writes,
     )
 
 
