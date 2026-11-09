@@ -36,7 +36,7 @@ def main():
         command = json.loads(line)
         op = command["op"]
         if op == "tools":
-            reply = sorted(n for n in registry.get_all_tool_names() if n.startswith("claude_task"))
+            reply = sorted(n for n in registry.get_all_tool_names() if n.startswith(("claude_task", "claude_workflow")))
         elif op == "gateway_on":
             manager.set_gateway_message_injector(manager, injector)
             reply = True
@@ -58,7 +58,7 @@ def main():
                      "text": cli._pending_input.queue[0] if cli._pending_input.qsize() else None}
         else:
             reply = {"error": f"unknown op {op}"}
-        print(json.dumps(reply), flush=True)
+        print(json.dumps(reply, default=str), flush=True)
 
 
 if __name__ == "__main__":

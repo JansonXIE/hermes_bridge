@@ -12,6 +12,8 @@ The prompt arrives on stdin, as with the real CLI. Directive lines drive behavio
   MERGE=<branch>   git merge a branch
   SECRET=<value>   echo a value in assistant text and in the result
   BIGLINE=<bytes>  emit one stream line of about that size
+  BASH=<command>   run a shell command as a Bash tool call (repeatable, in order with JSONFILE)
+  JSONFILE=<path> <json>  write a file; {HEAD} and {CHANGE_ID} are filled in from git at that moment
 Every start is appended to $FAKE_CLAUDE_LEDGER as one JSON line.
 """
 import json
@@ -31,9 +33,12 @@ def emit(obj):
 def main():
     prompt = sys.stdin.read()
     directives = {}
+    steps = []
     for line in prompt.splitlines():
         key, _, value = line.strip().partition("=")
-        if key.isupper():
+        if key in ("BASH", "JSONFILE"):
+            steps.append((key, value))
+        elif key.isupper():
             directives[key] = value
 
     if "--resume" in sys.argv:
@@ -86,6 +91,26 @@ def main():
             message = "[chore](test): merge\n\n[description ]:merge for test\n[root   cause]:NA\n"
             subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "--no-edit", "-m", message, branch],
                            check=True, stdout=subprocess.DEVNULL)
+
+    for number, (kind, value) in enumerate(steps):
+        if kind == "BASH":
+            tool_id = f"tu_bash_{number}"
+            emit({"type": "assistant", "session_id": session_id, "parent_tool_use_id": None, "message": {"content": [
+                {"type": "tool_use", "id": tool_id, "name": "Bash", "input": {"command": value}},
+            ]}})
+            done = subprocess.run(value, shell=True, capture_output=True, text=True)
+            emit({"type": "user", "session_id": session_id, "parent_tool_use_id": None, "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": done.stdout + done.stderr,
+                 "is_error": done.returncode != 0},
+            ]}})
+        else:
+            path, _, body = value.partition(" ")
+            head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+            message = subprocess.run(["git", "log", "-1", "--format=%B"], capture_output=True, text=True).stdout
+            change_id = next((ln.split(":", 1)[1].strip() for ln in message.splitlines() if ln.startswith("Change-Id:")), "")
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w") as f:
+                f.write(body.replace("{HEAD}", head).replace("{CHANGE_ID}", change_id))
 
     deadline = time.time() + float(directives.get("SLEEP", 0))
     while time.time() < deadline:

@@ -1,6 +1,6 @@
 # Hermes × Claude Code 异步任务桥接服务
 
-按 `hermes-claude-bridge.html` 方案实现 Phase 1（单机）和 Phase 2（接入 Hermes）。Hermes 负责决策，Claude Code 负责执行。任务后台运行，结束后自动唤起发起任务的 Hermes 会话，Hermes 不用占着一次模型调用等结果。
+按 `hermes-claude-bridge.html` 方案实现 Phase 1（单机）、Phase 2（接入 Hermes）和 Phase 2.5（开发 → Gerrit → 独立审核工作流）。Hermes 负责决策，Claude Code 负责执行。任务后台运行，结束后自动唤起发起任务的 Hermes 会话，Hermes 不用占着一次模型调用等结果。
 
 ```
 Hermes（claude-bridge 插件）
@@ -86,7 +86,7 @@ curl "$A/v1/health" -H "$H"                          # Worker 心跳、各状态
 
 `setup.sh` 已包含这一步。只装插件时用 `deploy/install_plugin.sh`：装到 `$HERMES_HOME/plugins` 并启用，剩余步骤按提示手动完成。
 
-Hermes 由此获得 `claude_task_start`、`claude_task_get`、`claude_task_list`、`claude_task_cancel` 四个工具。
+Hermes 由此获得 `claude_task_start`、`claude_task_get`、`claude_task_list`、`claude_task_cancel` 四个任务工具，以及 7 个 `claude_workflow_*` 工作流工具（见下文）。
 
 唤起路径（已按 Hermes v0.20.1 的实际代码核对）：
 
@@ -133,6 +133,41 @@ python3.11 -m hermes_bridge -c bridge.toml retry-dead <event_id>
 python3.11 -m hermes_bridge -c bridge.toml gc --days 14 --dry-run  # 回收 worktree；保留任务记录和分支，跳过有未提交改动的目录
 ```
 
+## 开发 → Gerrit → 独立审核工作流
+
+方案见 `hermes-claude-bridge.html` 第 03 节。Hermes 通过 7 个 `claude_workflow_*` 工具驱动，每一步结束都会唤起原会话，唤起消息里带有“下一步”。
+
+```
+claude_workflow_start ─► 开发任务（独立 worktree，按 gerrit-submit 规则 push 到 refs/for/<分支>）
+                           │ Worker 用本地 git 核验：Change-Id、单个 commit、push 目标、目标分支未含该提交
+                           ▼
+                 awaiting_review ─► claude_workflow_review ─► 审核任务（新会话、独立 worktree、按 SHA 检出、只读）
+                           │ Worker 校验 .bridge/review-report.json：结构、审核对象、未改动被跟踪文件、没有 push
+                           ▼
+   awaiting_approval ── 用户回复批准 ─► awaiting_merge ── 用户在 Gerrit 合入 ─► claude_workflow_merge_check ─► merged
+   changes_requested ── claude_workflow_rework（续接开发会话，amend 后推新 Patch Set）─► awaiting_review
+   review_blocked / needs_human ── 通知用户，按用户决定 rereview / rework / abandon
+```
+
+| 接口 | 作用 |
+|---|---|
+| `POST /v1/workflows` | 创建工作流并启动开发任务。必填 `project_id`（worktree 项目）、`requirement`、`acceptance_criteria`、`branch`（gerrit-submit 别名） |
+| `GET /v1/workflows`、`GET /v1/workflows/{id}` | 业务状态、Change-Id、revision、Gerrit 链接、任务、报告、状态迁移；`notification` 是可直接发给用户的通知 |
+| `GET /v1/workflows/{id}/reports/{report_id}` | 完整审核报告 |
+| `POST /v1/workflows/{id}/review` | 审核当前 revision；只在 `awaiting_review` 可用，重复调用返回同一个审核任务 |
+| `POST /v1/workflows/{id}/rework` | `source: "user"` 或 `"auto"`（仅 `rework_policy = "auto"` 且审核要求修改时）；超出 `max_rework_rounds` 转 `needs_human`；`rebase_only` 不计次数 |
+| `POST /v1/workflows/{id}/decisions` | `approve` / `reject` / `rereview`（可带外部推送的 `revision` 和 `fetch_ref`）/ `abandon`；按 `source_ref` 去重；不对 Gerrit 做任何操作 |
+| `POST /v1/workflows/{id}/merge-check` | Worker 异步 `git fetch` 目标分支并按 Change-Id 查找，结果通过唤起返回 |
+
+要点：
+
+- 工作流任务的执行状态（`succeeded` 等）和业务状态分开；审核任务成功也可能是“要求修改”。
+- 开发证据 `.bridge/dev-evidence.json` 和审核报告 `.bridge/review-report.json` 是约定文件。`.bridge/` 会写进仓库的 `info/exclude`，不会进入提交。
+- 工作流任务不做快照提交，否则 HEAD 会偏离推送的 revision。审核任务不运行 `verify_command`。
+- 角色附加的 `disallowed_tools`：审核任务禁止 `Edit`、`NotebookEdit`、`git push`、`git commit`；开发任务禁止推送到目标分支本身。这只是约束，结束后 Worker 仍会按工具日志和 git 核对。
+- Gerrit 账户能直接推送目标分支，所以无法事前阻止，只能事后发现（`direct_push_detected`、`target_contains_change`）并转人工。
+- 未结束工作流的 worktree 不会被 `gc` 回收，返工需要续接开发会话。
+
 ## 安全
 
 - 所有接口都要鉴权；令牌只能访问自己的任务和被授权的项目；`hermes_session_id` 绑定首个使用者。
@@ -158,10 +193,10 @@ systemd 环境下要确认 Claude 的认证可用：`ANTHROPIC_*` 变量需要�
 ## 测试
 
 ```bash
-python3.11 -m unittest tests.test_acceptance tests.test_hermes_plugin tests.test_provision
+python3.11 -m unittest tests.test_acceptance tests.test_hermes_plugin tests.test_provision tests.test_workflow
 ```
 
-测试启动真实的 api、worker、adapter 进程，用行为确定的假 Claude（事件格式取自真实 CLI）。`test_hermes_plugin` 使用本机已安装的 Hermes，未安装时跳过。
+测试启动真实的 api、worker、adapter 进程，用行为确定的假 Claude（事件格式取自真实 CLI）。`test_workflow` 用本地裸仓库充当 Gerrit remote。`test_hermes_plugin` 使用本机已安装的 Hermes，未安装时跳过；Hermes 自带解释器而不是 `venv/bin/python` 时，用 `HERMES_PYTHON` 指定其环境中的 python。
 
 | 方案首版验收标准 | 对应测试 |
 |---|---|

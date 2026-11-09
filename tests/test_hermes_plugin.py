@@ -13,7 +13,8 @@ from pathlib import Path
 from .harness import ADAPTER_TOKEN, ROOT, TOKEN, BridgeCase, http
 
 HERMES_DIR = Path(os.environ.get("HERMES_AGENT_DIR", Path.home() / ".hermes" / "hermes-agent"))
-HERMES_PYTHON = HERMES_DIR / "venv" / "bin" / "python"
+# A venv install by default; installs that bundle their own interpreter can point HERMES_PYTHON at it.
+HERMES_PYTHON = Path(os.environ.get("HERMES_PYTHON", HERMES_DIR / "venv" / "bin" / "python"))
 
 
 @unittest.skipUnless(HERMES_PYTHON.exists(), "Hermes is not installed")
@@ -56,7 +57,10 @@ class HermesPlugin(BridgeCase):
     def test_tools_and_gateway_wake_up_with_grant(self):
         driver = self.start_driver(grant=True)
         self.assertEqual(self.call(driver, op="tools"),
-                         ["claude_task_cancel", "claude_task_get", "claude_task_list", "claude_task_start"])
+                         ["claude_task_cancel", "claude_task_get", "claude_task_list", "claude_task_start",
+                          "claude_workflow_decide", "claude_workflow_get", "claude_workflow_list",
+                          "claude_workflow_merge_check", "claude_workflow_review", "claude_workflow_rework",
+                          "claude_workflow_start"])
         self.call(driver, op="gateway_on")
 
         key = "agent:main:weixin:dm:42"
@@ -90,6 +94,34 @@ class HermesPlugin(BridgeCase):
         cancelled = self.call(driver, op="tool", name="claude_task_cancel", args={"task_id": running["task_id"]})
         self.assertEqual(cancelled["status"], "cancelling")
         self.wait_status(running["task_id"], "cancelled")
+
+    def test_workflow_tools_and_wake_up(self):
+        driver = self.start_driver(grant=True)
+        self.call(driver, op="gateway_on")
+        key = "agent:main:weixin:dm:7"
+        # No Gerrit remote here: the developer cannot push, so the workflow stops for a human.
+        started = self.call(driver, op="tool", name="claude_workflow_start", session_id="hs_wf", session_key=key, args={
+            "project_id": "demo", "title": "demo change", "requirement": "add a file", "branch": "master",
+            "acceptance_criteria": ["the file exists"], "instructions": "WRITE=a.txt",
+        })
+        self.assertTrue(started["success"], started)
+        injected = self.wait_until(lambda: self.call(driver, op="injected"), timeout=30, message="workflow wake-up")
+        self.assertEqual(injected[0]["session_key"], key)
+        self.assertIn(started["workflow_id"], injected[0]["content"])
+        self.assertIn("需人工处理", injected[0]["content"])
+
+        got = self.call(driver, op="tool", name="claude_workflow_get", args={"workflow_id": started["workflow_id"]})
+        self.assertEqual(got["workflow"]["business_status"], "needs_human")
+        self.assertIn("evidence_missing", got["workflow"]["dev_submission"]["problems"])
+        self.assertIn("仅适用于本次 Patch Set", got["workflow"]["notification"])
+        refused = self.call(driver, op="tool", name="claude_workflow_review", args={"workflow_id": started["workflow_id"]})
+        self.assertFalse(refused["success"])
+        self.assertIn("invalid_state", refused["error"])
+        listed = self.call(driver, op="tool", name="claude_workflow_list", args={}, session_id="hs_wf")
+        self.assertEqual([w["workflow_id"] for w in listed["workflows"]], [started["workflow_id"]])
+        decided = self.call(driver, op="tool", name="claude_workflow_decide",
+                            args={"workflow_id": started["workflow_id"], "decision": "abandon", "source_ref": "m1"})
+        self.assertEqual(decided["business_status"], "abandoned")
 
     def test_without_grant_hermes_refuses_and_the_event_is_kept(self):
         driver = self.start_driver(grant=False)

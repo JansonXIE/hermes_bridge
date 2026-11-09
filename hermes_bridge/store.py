@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from . import workflow as wfm
+
 QUEUED = "queued"
 STARTING = "starting"
 RUNNING = "running"
@@ -135,7 +137,95 @@ CREATE TABLE IF NOT EXISTS workers (
     started_at REAL NOT NULL,
     heartbeat_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS workflows (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    owner TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    hermes_session_id TEXT,
+    hermes_session_key TEXT,
+    title TEXT,
+    requirement TEXT NOT NULL,
+    criteria TEXT NOT NULL,
+    criteria_version INTEGER NOT NULL DEFAULT 1,
+    instructions TEXT,
+    jira_id TEXT,
+    branch_alias TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    max_rework_rounds INTEGER NOT NULL,
+    rework_policy TEXT NOT NULL,
+    business_status TEXT NOT NULL,
+    attention TEXT,
+    review_round INTEGER NOT NULL DEFAULT 0,
+    rework_count INTEGER NOT NULL DEFAULT 0,
+    dev_task_id TEXT,
+    review_task_id TEXT,
+    latest_report_id TEXT,
+    base_commit TEXT,
+    change_id TEXT,
+    gerrit_url TEXT,
+    change_number INTEGER,
+    current_patchset INTEGER,
+    current_revision TEXT,
+    fetch_ref TEXT,
+    merged_commit TEXT,
+    merge_check_requested_at REAL,
+    merge_checked_at REAL,
+    merge_check_result TEXT,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE (owner, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS workflows_session ON workflows (hermes_session_id, seq);
+CREATE TABLE IF NOT EXISTS workflow_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workflow_id TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    cause_type TEXT NOT NULL,
+    cause_id TEXT NOT NULL,
+    detail TEXT,
+    at REAL NOT NULL,
+    UNIQUE (workflow_id, cause_id)
+);
+CREATE TABLE IF NOT EXISTS review_reports (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    task_id TEXT NOT NULL UNIQUE,
+    review_round INTEGER NOT NULL,
+    revision TEXT NOT NULL,
+    verdict TEXT,
+    valid INTEGER NOT NULL,
+    invalid_reason TEXT,
+    stale INTEGER NOT NULL DEFAULT 0,
+    report TEXT,
+    report_path TEXT,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS decisions (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    revision TEXT,
+    decision TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    note TEXT,
+    result TEXT NOT NULL,
+    at REAL NOT NULL,
+    UNIQUE (workflow_id, source_ref)
+);
 """
+
+# Columns added after the first release; existing databases are upgraded in place.
+_TASK_COLUMNS = {
+    "workflow_id": "TEXT",
+    "role": "TEXT",
+    "parent_task_id": "TEXT",
+    "review_round": "INTEGER",
+    "review_subject": "TEXT",
+}
 
 
 class LeaseLost(Exception):
@@ -152,6 +242,16 @@ class SessionForbidden(Exception):
 
 class InvalidReference(Exception):
     pass
+
+
+class WorkflowConflict(Exception):
+    """The workflow is not in a state that allows the request."""
+
+    def __init__(self, code: str, message: str, workflow: Optional[dict] = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.workflow = workflow
 
 
 def new_id(prefix: str) -> str:
@@ -186,6 +286,18 @@ class Store:
         self._local = threading.local()
         Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        present = {r["name"] for r in self.conn.execute("PRAGMA table_info(tasks)")}
+        for name, kind in _TASK_COLUMNS.items():
+            if name not in present:
+                try:
+                    self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {kind}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc):  # another process got there first
+                        raise
+        self.conn.execute("CREATE INDEX IF NOT EXISTS tasks_workflow ON tasks (workflow_id, seq)")
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -212,48 +324,65 @@ class Store:
         """Insert a queued task. Returns (task, created); a replayed key returns the original."""
         now = time.time()
         with self.tx() as c:
-            existing = c.execute(
-                "SELECT * FROM tasks WHERE owner=? AND idempotency_key=?", (owner, idempotency_key)
-            ).fetchone()
+            existing = self._replay(c, "tasks", owner, idempotency_key, request_hash)
             if existing:
-                if existing["request_hash"] != request_hash:
-                    raise IdempotencyConflict(idempotency_key)
-                return dict(existing), False
+                return existing, False
+            task_id = self._insert_task(c, owner, idempotency_key, request_hash, spec, now)
+            return self._task_row(c, task_id), True
 
-            session_id = spec.get("hermes_session_id")
-            if session_id:
-                bound = c.execute(
-                    "SELECT owner FROM sessions WHERE hermes_session_id=?", (session_id,)
-                ).fetchone()
-                if bound and bound["owner"] != owner:
-                    raise SessionForbidden(session_id)
-                if not bound:
-                    c.execute("INSERT INTO sessions VALUES (?,?,?)", (session_id, owner, now))
+    @staticmethod
+    def _replay(c, table: str, owner: str, idempotency_key: str, request_hash: str) -> Optional[dict]:
+        existing = c.execute(
+            f"SELECT * FROM {table} WHERE owner=? AND idempotency_key=?", (owner, idempotency_key)
+        ).fetchone()
+        if existing and existing["request_hash"] != request_hash:
+            raise IdempotencyConflict(idempotency_key)
+        return _row(existing)
 
-            references = list(spec.get("depends_on", []))
-            if spec.get("continue_task_id"):
-                references.append(spec["continue_task_id"])
-            for ref in references:
-                row = c.execute("SELECT owner, project_id FROM tasks WHERE id=?", (ref,)).fetchone()
-                if not row or row["owner"] != owner or row["project_id"] != spec["project_id"]:
-                    raise InvalidReference(ref)
+    @staticmethod
+    def _bind_session(c, session_id: Optional[str], owner: str, now: float) -> None:
+        if not session_id:
+            return
+        bound = c.execute("SELECT owner FROM sessions WHERE hermes_session_id=?", (session_id,)).fetchone()
+        if bound and bound["owner"] != owner:
+            raise SessionForbidden(session_id)
+        if not bound:
+            c.execute("INSERT INTO sessions VALUES (?,?,?)", (session_id, owner, now))
 
-            task_id = new_id("task")
-            c.execute(
-                """INSERT INTO tasks (id, owner, project_id, hermes_session_id, hermes_session_key, title,
-                       prompt, kind, status, idempotency_key, request_hash, timeout_seconds, depends_on,
-                       continue_task_id, safe_to_retry, model, effort, max_budget_usd, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    task_id, owner, spec["project_id"], session_id, spec.get("hermes_session_key"),
-                    spec.get("title"), spec["prompt"], spec.get("kind", "task"), QUEUED, idempotency_key,
-                    request_hash, spec["timeout_seconds"], json.dumps(spec.get("depends_on", [])),
-                    spec.get("continue_task_id"), int(bool(spec.get("safe_to_retry"))), spec.get("model"),
-                    spec.get("effort"), spec.get("max_budget_usd"), now, now,
-                ),
-            )
-            self._add_event(c, task_id, "state.changed", {"status": QUEUED})
-            return dict(c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()), True
+    @staticmethod
+    def _task_row(c, task_id: str) -> dict:
+        return dict(c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+
+    def _insert_task(self, c, owner: str, idempotency_key: str, request_hash: str, spec: dict, now: float) -> str:
+        session_id = spec.get("hermes_session_id")
+        self._bind_session(c, session_id, owner, now)
+        references = list(spec.get("depends_on", []))
+        if spec.get("continue_task_id"):
+            references.append(spec["continue_task_id"])
+        for ref in references:
+            row = c.execute("SELECT owner, project_id FROM tasks WHERE id=?", (ref,)).fetchone()
+            if not row or row["owner"] != owner or row["project_id"] != spec["project_id"]:
+                raise InvalidReference(ref)
+
+        task_id = new_id("task")
+        c.execute(
+            """INSERT INTO tasks (id, owner, project_id, hermes_session_id, hermes_session_key, title,
+                   prompt, kind, status, idempotency_key, request_hash, timeout_seconds, depends_on,
+                   continue_task_id, safe_to_retry, model, effort, max_budget_usd, created_at, updated_at,
+                   workflow_id, role, parent_task_id, review_round, review_subject)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                task_id, owner, spec["project_id"], session_id, spec.get("hermes_session_key"),
+                spec.get("title"), spec["prompt"], spec.get("kind", "task"), QUEUED, idempotency_key,
+                request_hash, spec["timeout_seconds"], json.dumps(spec.get("depends_on", [])),
+                spec.get("continue_task_id"), int(bool(spec.get("safe_to_retry"))), spec.get("model"),
+                spec.get("effort"), spec.get("max_budget_usd"), now, now,
+                spec.get("workflow_id"), spec.get("role"), spec.get("parent_task_id"), spec.get("review_round"),
+                json.dumps(spec["review_subject"], ensure_ascii=False) if spec.get("review_subject") else None,
+            ),
+        )
+        self._add_event(c, task_id, "state.changed", {"status": QUEUED})
+        return task_id
 
     def get_task(self, task_id: str, owner: Optional[str] = None) -> Optional[dict]:
         if owner is None:
@@ -479,16 +608,17 @@ class Store:
                        result: Optional[dict] = None, changes: Optional[dict] = None,
                        acceptance: Optional[dict] = None, error_code: Optional[str] = None,
                        error_message: Optional[str] = None, exit_code: Optional[int] = None,
-                       exit_signal: Optional[int] = None) -> None:
+                       exit_signal: Optional[int] = None, workflow_outcome: Optional[dict] = None) -> None:
         """Commit the terminal state and its notification in one transaction."""
         now = time.time()
         with self.tx() as c:
             self._fence(c, attempt_id, token, "exit_code=?, exit_signal=?, end_reason=?, ended_at=?",
                         (exit_code, exit_signal, error_code or status, now))
-            self._finish_task(c, task_id, status, now, result, changes, acceptance, error_code, error_message)
+            self._finish_task(c, task_id, status, now, result, changes, acceptance, error_code, error_message,
+                              workflow_outcome)
 
     def _finish_task(self, c, task_id, status, now, result=None, changes=None, acceptance=None,
-                     error_code=None, error_message=None) -> None:
+                     error_code=None, error_message=None, workflow_outcome=None) -> None:
         c.execute(
             """UPDATE tasks SET status=?, result=?, changes=?, acceptance=?, error_code=?, error_message=?,
                    finished_at=?, slot=NULL WHERE id=?""",
@@ -501,7 +631,12 @@ class Store:
             ),
         )
         self._add_event(c, task_id, "state.changed", {"status": status, "error_code": error_code})
-        self._enqueue_notification(c, task_id, "task.completed", now)
+        task = self._task_row(c, task_id)
+        if task["workflow_id"]:
+            # Workflow tasks wake Hermes once, with the business outcome instead of a bare task status.
+            self._workflow_task_finished(c, task, now, workflow_outcome)
+        else:
+            self._enqueue_notification(c, task_id, "task.completed", now)
 
     def requeue_for_retry(self, attempt_id: str, token: int, task_id: str, reason: str) -> None:
         now = time.time()
@@ -655,6 +790,342 @@ class Store:
     def outbox_counts(self) -> dict[str, int]:
         return {r["state"]: r["n"] for r in self.conn.execute("SELECT state, count(*) n FROM outbox GROUP BY state")}
 
+    # ---- workflows ------------------------------------------------------
+
+    @staticmethod
+    def _wf_row(c, workflow_id: str) -> dict:
+        return dict(c.execute("SELECT * FROM workflows WHERE id=?", (workflow_id,)).fetchone())
+
+    def _owned_workflow(self, c, workflow_id: str, owner: str) -> dict:
+        row = c.execute("SELECT * FROM workflows WHERE id=? AND owner=?", (workflow_id, owner)).fetchone()
+        if not row:
+            raise WorkflowConflict("workflow_not_found", "no such workflow")
+        return dict(row)
+
+    def _transition(self, c, wf: dict, to: str, cause_type: str, cause_id: str, now: float,
+                    detail: Optional[str] = None, **fields: Any) -> bool:
+        """Move the business state once per cause; a repeated cause changes nothing."""
+        inserted = c.execute(
+            """INSERT OR IGNORE INTO workflow_transitions (workflow_id, from_status, to_status, cause_type, cause_id, detail, at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (wf["id"], wf["business_status"], to, cause_type, cause_id, detail, now),
+        ).rowcount
+        if not inserted:
+            return False
+        fields = {"business_status": to, "updated_at": now, **fields}
+        c.execute(
+            f"UPDATE workflows SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
+            (*fields.values(), wf["id"]),
+        )
+        wf.update(fields)
+        return True
+
+    def create_workflow(self, owner: str, idempotency_key: str, request_hash: str, spec: dict,
+                        task_spec: dict, remote: str) -> tuple[dict, dict, bool]:
+        """Create the workflow and its development task together. Returns (workflow, task, created)."""
+        now = time.time()
+        with self.tx() as c:
+            existing = self._replay(c, "workflows", owner, idempotency_key, request_hash)
+            if existing:
+                return existing, self._task_row(c, existing["dev_task_id"]), False
+            self._bind_session(c, spec.get("hermes_session_id"), owner, now)
+            workflow_id = new_id("wf")
+            c.execute(
+                """INSERT INTO workflows (id, owner, project_id, hermes_session_id, hermes_session_key, title,
+                       requirement, criteria, criteria_version, instructions, jira_id, branch_alias, target_branch,
+                       max_rework_rounds, rework_policy, business_status, idempotency_key, request_hash,
+                       created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    workflow_id, owner, spec["project_id"], spec.get("hermes_session_id"), spec.get("hermes_session_key"),
+                    spec.get("title"), spec["requirement"], json.dumps(spec["criteria"], ensure_ascii=False),
+                    spec["criteria_version"], spec.get("instructions"), spec.get("jira_id"), spec["branch_alias"],
+                    spec["target_branch"], spec["max_rework_rounds"], spec["rework_policy"], wfm.DEVELOPING,
+                    idempotency_key, request_hash, now, now,
+                ),
+            )
+            wf = self._wf_row(c, workflow_id)
+            task_id = self._insert_task(c, owner, f"wf:{workflow_id}:develop", request_hash, {
+                **task_spec, "project_id": spec["project_id"], "hermes_session_id": spec.get("hermes_session_id"),
+                "hermes_session_key": spec.get("hermes_session_key"), "workflow_id": workflow_id,
+                "role": wfm.DEVELOP, "prompt": wfm.dev_prompt(wf, remote),
+                "title": f"[开发] {spec.get('title') or workflow_id}"[:200],
+            }, now)
+            c.execute("UPDATE workflows SET dev_task_id=? WHERE id=?", (task_id, workflow_id))
+            c.execute(
+                """INSERT INTO workflow_transitions (workflow_id, from_status, to_status, cause_type, cause_id, at)
+                   VALUES (?,?,?,?,?,?)""",
+                (workflow_id, None, wfm.DEVELOPING, "create", "create", now),
+            )
+            return self._wf_row(c, workflow_id), self._task_row(c, task_id), True
+
+    def get_workflow(self, workflow_id: str, owner: Optional[str] = None) -> Optional[dict]:
+        if owner is None:
+            return _row(self.conn.execute("SELECT * FROM workflows WHERE id=?", (workflow_id,)).fetchone())
+        return _row(self.conn.execute("SELECT * FROM workflows WHERE id=? AND owner=?", (workflow_id, owner)).fetchone())
+
+    def list_workflows(self, owner: str, hermes_session_id: Optional[str] = None, statuses: Optional[list[str]] = None,
+                       limit: int = 50) -> list[dict]:
+        where, params = ["owner=?"], [owner]
+        if hermes_session_id:
+            where.append("hermes_session_id=?")
+            params.append(hermes_session_id)
+        if statuses:
+            where.append(f"business_status IN ({','.join('?' * len(statuses))})")
+            params += statuses
+        sql = f"SELECT * FROM workflows WHERE {' AND '.join(where)} ORDER BY seq DESC LIMIT ?"
+        return [dict(r) for r in self.conn.execute(sql, [*params, limit])]
+
+    def workflow_tasks(self, workflow_id: str) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM tasks WHERE workflow_id=? ORDER BY seq", (workflow_id,))]
+
+    def workflow_transitions(self, workflow_id: str) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM workflow_transitions WHERE workflow_id=? ORDER BY id", (workflow_id,))]
+
+    def workflow_reports(self, workflow_id: str) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM review_reports WHERE workflow_id=? ORDER BY review_round, created_at", (workflow_id,))]
+
+    def workflow_decisions(self, workflow_id: str) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM decisions WHERE workflow_id=? ORDER BY at", (workflow_id,))]
+
+    def get_report(self, report_id: Optional[str]) -> Optional[dict]:
+        return _row(self.conn.execute("SELECT * FROM review_reports WHERE id=?", (report_id,)).fetchone())
+
+    def start_review(self, owner: str, workflow_id: str, idempotency_key: str, request_hash: str,
+                     task_spec: dict, instructions: Optional[str]) -> tuple[dict, dict, bool]:
+        """Open the next review round on the current revision, in a fresh session and worktree."""
+        now = time.time()
+        with self.tx() as c:
+            wf = self._owned_workflow(c, workflow_id, owner)
+            existing = self._replay(c, "tasks", owner, idempotency_key, request_hash)
+            if existing:
+                return wf, existing, False
+            if wf["business_status"] == wfm.REVIEWING and wf["review_task_id"]:
+                # A repeated wake-up must not open a second review of the same revision.
+                return wf, self._task_row(c, wf["review_task_id"]), False
+            if wf["business_status"] != wfm.AWAITING_REVIEW:
+                raise WorkflowConflict("invalid_state", f"a review can start only in {wfm.AWAITING_REVIEW}, "
+                                       f"the workflow is {wf['business_status']}", wf)
+            round_number = wf["review_round"] + 1
+            subject = {
+                "revision": wf["current_revision"], "change_id": wf["change_id"], "gerrit_url": wf["gerrit_url"],
+                "change_number": wf["change_number"], "patchset": wf["current_patchset"],
+                "target_branch": wf["target_branch"], "criteria_version": wf["criteria_version"],
+                "review_round": round_number, "fetch_ref": wf["fetch_ref"],
+            }
+            dev = c.execute("SELECT changes FROM tasks WHERE id=?", (wf["dev_task_id"],)).fetchone()
+            previous = _row(c.execute("SELECT * FROM review_reports WHERE id=?", (wf["latest_report_id"],)).fetchone())
+            task_id = self._insert_task(c, owner, idempotency_key, request_hash, {
+                **task_spec, "project_id": wf["project_id"], "hermes_session_id": wf["hermes_session_id"],
+                "hermes_session_key": wf["hermes_session_key"], "workflow_id": workflow_id, "role": wfm.REVIEW,
+                "parent_task_id": wf["dev_task_id"], "review_round": round_number, "review_subject": subject,
+                # Reviews only read, so re-running one after a lost process is harmless.
+                "safe_to_retry": True,
+                "prompt": wfm.review_prompt(wf, subject, json.loads(dev["changes"]) if dev and dev["changes"] else None,
+                                            previous if previous and previous["valid"] else None, instructions),
+                "title": f"[审核 R{round_number}] {wf['title'] or workflow_id}"[:200],
+            }, now)
+            self._transition(c, wf, wfm.REVIEWING, "review", f"review:{round_number}", now,
+                             review_round=round_number, review_task_id=task_id, attention=None)
+            return wf, self._task_row(c, task_id), True
+
+    def start_rework(self, owner: str, workflow_id: str, idempotency_key: str, request_hash: str, task_spec: dict,
+                     source: str, instructions: Optional[str], rebase_only: bool, remote: str) -> tuple[dict, dict, bool]:
+        """Resume the development session to push a new patch set, within the rework policy and limit."""
+        now = time.time()
+        limit_hit = None
+        with self.tx() as c:
+            wf = self._owned_workflow(c, workflow_id, owner)
+            existing = self._replay(c, "tasks", owner, idempotency_key, request_hash)
+            if existing:
+                return wf, existing, False
+            status = wf["business_status"]
+            if status == wfm.REWORKING:
+                return wf, self._task_row(c, wf["dev_task_id"]), False
+            if status not in (wfm.CHANGES_REQUESTED, wfm.REVIEW_BLOCKED, wfm.NEEDS_HUMAN,
+                              wfm.AWAITING_APPROVAL, wfm.AWAITING_MERGE):
+                raise WorkflowConflict("invalid_state", f"rework is not possible in {status}", wf)
+            # Only a review that asked for changes may trigger rework without the user, and only under 'auto'.
+            if source != "user" and not (status == wfm.CHANGES_REQUESTED and wf["rework_policy"] == "auto"):
+                raise WorkflowConflict("confirmation_required",
+                                       "this rework needs the user's confirmation; resubmit with source='user'", wf)
+            dev = c.execute("SELECT * FROM tasks WHERE id=?", (wf["dev_task_id"],)).fetchone()
+            if not dev or dev["status"] not in TERMINAL or not dev["claude_session_id"]:
+                raise WorkflowConflict("continue_unavailable", "the development task has no resumable session", wf)
+            if not rebase_only and wf["rework_count"] >= wf["max_rework_rounds"]:
+                attention = f"返工已达上限 {wf['max_rework_rounds']} 次"
+                self._transition(c, wf, wfm.NEEDS_HUMAN, "limit", f"limit:{wf['latest_report_id'] or wf['review_round']}",
+                                 now, attention, attention=attention)
+                limit_hit = WorkflowConflict("rework_limit_reached", attention + "，已转为需人工处理", dict(wf))
+            else:
+                report = _row(c.execute("SELECT * FROM review_reports WHERE id=?", (wf["latest_report_id"],)).fetchone())
+                task_id = self._insert_task(c, owner, idempotency_key, request_hash, {
+                    **task_spec, "project_id": wf["project_id"], "hermes_session_id": wf["hermes_session_id"],
+                    "hermes_session_key": wf["hermes_session_key"], "workflow_id": workflow_id, "role": wfm.REWORK,
+                    "parent_task_id": wf["review_task_id"] or wf["dev_task_id"], "continue_task_id": wf["dev_task_id"],
+                    "prompt": wfm.rework_prompt(wf, remote, report if report and report["valid"] else None,
+                                                instructions, rebase_only),
+                    "title": f"[{'rebase' if rebase_only else '返工'}] {wf['title'] or workflow_id}"[:200],
+                }, now)
+                self._transition(c, wf, wfm.REWORKING, "rework", f"rework:{task_id}", now, source,
+                                 dev_task_id=task_id, rework_count=wf["rework_count"] + (0 if rebase_only else 1),
+                                 attention=None)
+                return wf, self._task_row(c, task_id), True
+        raise limit_hit
+
+    _DECISIONS = {
+        "approve": ((wfm.AWAITING_APPROVAL,), wfm.AWAITING_MERGE),
+        "reject": ((wfm.AWAITING_APPROVAL, wfm.AWAITING_MERGE, wfm.CHANGES_REQUESTED, wfm.REVIEW_BLOCKED,
+                    wfm.NEEDS_HUMAN), wfm.REJECTED),
+        "rereview": ((wfm.REVIEW_BLOCKED, wfm.NEEDS_HUMAN, wfm.CHANGES_REQUESTED, wfm.AWAITING_APPROVAL,
+                      wfm.AWAITING_MERGE), wfm.AWAITING_REVIEW),
+        "abandon": (None, wfm.ABANDONED),
+    }
+
+    def decide(self, owner: str, workflow_id: str, decision: str, source: str, source_ref: str,
+               note: Optional[str], revision: Optional[str], fetch_ref: Optional[str]) -> tuple[dict, dict, bool]:
+        """Record a human decision once per source_ref. It never touches Gerrit."""
+        now = time.time()
+        with self.tx() as c:
+            wf = self._owned_workflow(c, workflow_id, owner)
+            done = c.execute("SELECT * FROM decisions WHERE workflow_id=? AND source_ref=?", (workflow_id, source_ref)).fetchone()
+            if done:
+                return wf, dict(done), False
+            allowed, target = self._DECISIONS[decision]
+            status = wf["business_status"]
+            if status in wfm.FINAL or (allowed is not None and status not in allowed):
+                raise WorkflowConflict("invalid_state", f"'{decision}' is not possible in {status}", wf)
+            fields: dict[str, Any] = {"attention": None}
+            if decision == "rereview":
+                if revision:
+                    # A patch set pushed outside the bridge: review exactly what the user named.
+                    fields.update(current_revision=revision, fetch_ref=fetch_ref, current_patchset=None)
+                elif not wf["current_revision"]:
+                    raise WorkflowConflict("no_revision", "there is no revision to review yet; give one", wf)
+            decision_id = new_id("dec")
+            result = {"from": status, "to": target}
+            c.execute(
+                "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?)",
+                (decision_id, workflow_id, wf["current_revision"], decision, source, source_ref, note,
+                 json.dumps(result), now),
+            )
+            self._transition(c, wf, target, "decision", f"decision:{source_ref}", now, note, **fields)
+            return wf, dict(c.execute("SELECT * FROM decisions WHERE id=?", (decision_id,)).fetchone()), True
+
+    def request_merge_check(self, owner: str, workflow_id: str) -> dict:
+        now = time.time()
+        with self.tx() as c:
+            wf = self._owned_workflow(c, workflow_id, owner)
+            if wf["business_status"] in wfm.FINAL or not wf["change_id"]:
+                raise WorkflowConflict("invalid_state", "nothing to check: the workflow is finished or has no Change-Id", wf)
+            pending = wf["merge_check_requested_at"] and (wf["merge_checked_at"] or 0) < wf["merge_check_requested_at"]
+            if not pending:
+                c.execute("UPDATE workflows SET merge_check_requested_at=?, updated_at=? WHERE id=?", (now, now, workflow_id))
+            return self._wf_row(c, workflow_id)
+
+    def pending_merge_checks(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            """SELECT * FROM workflows WHERE merge_check_requested_at IS NOT NULL
+               AND (merge_checked_at IS NULL OR merge_checked_at < merge_check_requested_at)""")]
+
+    def record_merge_check(self, workflow_id: str, requested_at: float, merged_commit: Optional[str],
+                           error: Optional[str]) -> None:
+        now = time.time()
+        with self.tx() as c:
+            wf = self._wf_row(c, workflow_id)
+            if wf["merge_check_requested_at"] != requested_at:
+                return  # superseded by a newer request, which will be checked separately
+            result = {"merged_commit": merged_commit, "error": error, "checked_at": now}
+            c.execute("UPDATE workflows SET merge_checked_at=?, merge_check_result=?, updated_at=? WHERE id=?",
+                      (max(now, requested_at), json.dumps(result), now, workflow_id))
+            wf = self._wf_row(c, workflow_id)
+            if merged_commit and wf["business_status"] not in wfm.FINAL:
+                self._transition(c, wf, wfm.MERGED, "merge_check", f"merge_check:{requested_at}", now,
+                                 merged_commit, merged_commit=merged_commit, attention=None)
+            self._enqueue_workflow_event(c, wf, "workflow.merge_checked", now, None,
+                                         {"merged": bool(merged_commit), "merge_check_error": error is not None})
+
+    def _workflow_task_finished(self, c, task: dict, now: float, outcome: Optional[dict]) -> None:
+        wf = self._wf_row(c, task["workflow_id"])
+        outcome = outcome or {}
+        problems = list(outcome.get("problems") or [])
+        extra: dict[str, Any] = {"task_status": task["status"], "role": task["role"], "error_code": task["error_code"]}
+        if task["role"] in (wfm.DEVELOP, wfm.REWORK):
+            event = "workflow.dev_completed"
+            current = wf["dev_task_id"] == task["id"] and wf["business_status"] in (wfm.DEVELOPING, wfm.REWORKING)
+            gerrit = outcome.get("gerrit") or {}
+            if current and task["status"] == SUCCEEDED and gerrit and not problems:
+                fields = {
+                    "current_revision": gerrit["revision"], "change_id": gerrit["change_id"],
+                    "gerrit_url": gerrit.get("gerrit_url") or wf["gerrit_url"],
+                    "change_number": gerrit.get("change_number") or wf["change_number"],
+                    "current_patchset": gerrit.get("patchset"), "fetch_ref": None, "attention": None,
+                }
+                if task["role"] == wfm.DEVELOP:
+                    fields["base_commit"] = task["base_commit"]
+                self._transition(c, wf, wfm.AWAITING_REVIEW, "task", f"task:{task['id']}", now, **fields)
+            elif current:
+                reason = ", ".join(problems) or f"task {task['status']}" + (f" ({task['error_code']})" if task["error_code"] else "")
+                self._transition(c, wf, wfm.NEEDS_HUMAN, "task", f"task:{task['id']}", now, reason,
+                                 attention=f"开发任务未通过提交核验：{reason}")
+            extra.update(problems=problems, stale=not current)
+        else:
+            event = "workflow.review_completed"
+            current = wf["review_task_id"] == task["id"] and wf["business_status"] == wfm.REVIEWING
+            subject = json.loads(task["review_subject"] or "{}")
+            report = outcome.get("report")
+            invalid = outcome.get("invalid_reason")
+            if task["status"] != SUCCEEDED:
+                invalid = invalid or f"review task ended as {task['status']}" + (f" ({task['error_code']})" if task["error_code"] else "")
+            report_id = None
+            if report is not None or invalid:
+                report_id = new_id("rpt")
+                c.execute(
+                    "INSERT OR IGNORE INTO review_reports VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (report_id, wf["id"], task["id"], task["review_round"], subject.get("revision") or "",
+                     report["verdict"] if report and not invalid else None, int(bool(report) and not invalid), invalid,
+                     int(not current), json.dumps(report, ensure_ascii=False) if report else None,
+                     outcome.get("report_path"), now),
+                )
+            if current:
+                verdict = report["verdict"] if report and not invalid else None
+                target = {wfm.APPROVE: wfm.AWAITING_APPROVAL, wfm.CHANGES: wfm.CHANGES_REQUESTED}.get(verdict, wfm.REVIEW_BLOCKED)
+                attention = None
+                if target == wfm.REVIEW_BLOCKED:
+                    attention = invalid or "；".join((report or {}).get("blocked_reasons") or []) or "审核无法得出结论"
+                self._transition(c, wf, target, "task", f"task:{task['id']}", now, attention,
+                                 latest_report_id=report_id, attention=attention)
+            extra.update(verdict=report["verdict"] if report and not invalid else None, report_valid=not invalid,
+                         report_id=report_id, stale=not current, review_round=task["review_round"])
+        self._enqueue_workflow_event(c, self._wf_row(c, wf["id"]), event, now, task["id"], extra)
+
+    def _enqueue_workflow_event(self, c, wf: dict, event_type: str, now: float, task_id: Optional[str], extra: dict) -> None:
+        if not wf["hermes_session_id"]:
+            return
+        event_id = new_id("evt")
+        payload = {
+            "event_id": event_id,
+            "type": event_type,
+            "workflow_id": wf["id"],
+            "task_id": task_id,
+            "project_id": wf["project_id"],
+            "hermes_session_id": wf["hermes_session_id"],
+            "hermes_session_key": wf["hermes_session_key"],
+            "business_status": wf["business_status"],
+            "review_round": wf["review_round"],
+            "revision": wf["current_revision"],
+            "rework_policy": wf["rework_policy"],
+            "result_ref": f"/v1/workflows/{wf['id']}",
+            "occurred_at": now,
+            **extra,
+        }
+        c.execute(
+            "INSERT INTO outbox (event_id, task_id, type, payload, next_attempt_at, created_at) VALUES (?,?,?,?,?,?)",
+            (event_id, task_id or wf["id"], event_type, json.dumps(payload, ensure_ascii=False), now, now),
+        )
+
     # ---- housekeeping ---------------------------------------------------
 
     def collectable_tasks(self, finished_before: float) -> list[dict]:
@@ -662,6 +1133,9 @@ class Store:
         rows = self.conn.execute(
             f"""SELECT t.* FROM tasks t
                 WHERE t.status IN ({_TERMINAL_SQL}) AND t.finished_at < ? AND t.workdir IS NOT NULL
+                  AND (t.workflow_id IS NULL OR EXISTS (
+                      SELECT 1 FROM workflows w WHERE w.id = t.workflow_id
+                        AND w.business_status IN ({",".join(f"'{s}'" for s in wfm.FINAL)})))
                   AND NOT EXISTS (
                       SELECT 1 FROM tasks f
                       WHERE (f.continue_task_id = t.id OR f.workdir = t.workdir) AND f.id != t.id

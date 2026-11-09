@@ -47,6 +47,22 @@ max_attempts = 10
 # fallback_command = ["hermes", "chat", "--resume", "{session_id}", "-Q", "-q", "{prompt}", "--source", "tool"]
 # fallback_after_seconds = 120
 
+# Develop → Gerrit → independent review workflow (/v1/workflows). Only git is used against Gerrit:
+# developers push to refs/for/<branch>, the bridge fetches to check; it never comments, votes or merges.
+[workflow]
+remote = "origin"              # remote the developer pushes to and the bridge fetches from
+max_rework_rounds = 2          # default per workflow; past it the workflow goes to needs_human
+rework_policy = "confirm"      # "confirm": ask the user before each rework; "auto": rework within the limit
+fetch_timeout_seconds = 300
+# Branch aliases of the gerrit-submit skill (alias -> target branch); this is the built-in default.
+# [workflow.branches]
+# "420" = "v4.2.0"
+# "410" = "v4.1.0"
+# master = "master"
+# "632" = "v6.3.2"
+# "萤石5部" = "bm1688_ezviz_division5"
+# "RTT-A2" = "A2_dev"
+
 [projects.backend-api]
 path = "/path/to/repo"         # only configured projects can be reached
 isolation = "worktree"         # or "directory" for an empty per-task directory, or "inplace" (see below)

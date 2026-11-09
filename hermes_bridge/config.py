@@ -37,6 +37,17 @@ DEFAULT_COMMIT_MESSAGE = """[chore](bridge): {action} for {task_id}
 """
 
 
+# Branch aliases of the gerrit-submit skill: alias -> target branch, pushed as refs/for/<branch>.
+DEFAULT_WORKFLOW_BRANCHES = {
+    "420": "v4.2.0",
+    "410": "v4.1.0",
+    "master": "master",
+    "632": "v6.3.2",
+    "萤石5部": "bm1688_ezviz_division5",
+    "RTT-A2": "A2_dev",
+}
+REWORK_POLICIES = ("confirm", "auto")
+
 INPLACE_ALLOWED_TOOLS = ("Read", "Glob", "Grep")
 INPLACE_DENIED_TOOLS = ("Edit", "Write", "NotebookEdit", "Bash")
 
@@ -119,6 +130,11 @@ class Config:
     adapter_fallback_command: tuple[str, ...] = ()
     adapter_fallback_after_seconds: float = 120.0
     adapter_fallback_timeout_seconds: float = 900.0
+    workflow_remote: str = "origin"
+    workflow_branches: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_WORKFLOW_BRANCHES))
+    workflow_max_rework_rounds: int = 2
+    workflow_rework_policy: str = "confirm"
+    workflow_fetch_timeout_seconds: float = 300.0
 
     @property
     def db_path(self) -> Path:
@@ -238,6 +254,17 @@ def load_config(path: str | Path) -> Config:
     notify = raw.get("notify", {})
     adapter = raw.get("adapter", {})
 
+    workflow = raw.get("workflow", {})
+    branches = workflow.get("branches", DEFAULT_WORKFLOW_BRANCHES)
+    if not isinstance(branches, dict) or not all(isinstance(v, str) and v for v in branches.values()):
+        raise ConfigError("workflow.branches: must map each alias to a branch name")
+    policy = workflow.get("rework_policy", "confirm")
+    if policy not in REWORK_POLICIES:
+        raise ConfigError(f"workflow.rework_policy: one of {list(REWORK_POLICIES)}")
+    rounds = workflow.get("max_rework_rounds", 2)
+    if type(rounds) is not int or rounds < 0:
+        raise ConfigError("workflow.max_rework_rounds: non-negative integer")
+
     numeric = {
         k: worker[k]
         for k in (
@@ -286,6 +313,11 @@ def load_config(path: str | Path) -> Config:
         adapter_port=int(adapter.get("port", 8766)),
         adapter_token=_secret(adapter, "token", "adapter"),
         adapter_fallback_command=tuple(adapter.get("fallback_command", ())),
+        workflow_remote=workflow.get("remote", "origin"),
+        workflow_branches=dict(branches),
+        workflow_max_rework_rounds=rounds,
+        workflow_rework_policy=policy,
+        workflow_fetch_timeout_seconds=float(workflow.get("fetch_timeout_seconds", 300)),
         **numeric,
         **optional,
     )

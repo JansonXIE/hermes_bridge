@@ -172,7 +172,7 @@ START_SCHEMA = {
     "name": "claude_task_start",
     "description": (
         "Start a Claude Code worker on a project and return immediately with a task_id. The worker runs "
-        "in its own git worktree and branch. Do not wait or poll in a loop: this conversation is woken up "
+        "in its own git worktree and branch (inplace projects run in the live directory). Do not wait or poll in a loop: this conversation is woken up "
         "automatically when the task ends. Use depends_on to order tasks, and kind='integration' with "
         "depends_on to merge finished branches and re-run the tests. Use continue_task_id to send follow-up "
         "instructions to the same Claude session after its task has ended."
@@ -245,6 +245,144 @@ CANCEL_SCHEMA = {
     },
 }
 
+_RUN_PROPS = {
+    "timeout_seconds": {"type": "integer", "description": "Hard time limit for this Claude Code run."},
+    "model": {"type": "string"},
+    "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
+    "max_budget_usd": {"type": "number"},
+}
+
+WORKFLOW_START_SCHEMA = {
+    "name": "claude_workflow_start",
+    "description": (
+        "Start the develop → Gerrit → independent review workflow and return immediately. A Claude Code developer "
+        "implements the requirement in its own worktree, self-tests, commits by the gerrit-submit rules and pushes to "
+        "refs/for/<branch> (never to the branch itself). This conversation is woken at every step; follow the "
+        "'下一步' line of each wake-up. Nothing is ever merged automatically: the user approves and merges in Gerrit. "
+        "Pass the user's original requirement verbatim and the acceptance criteria. branch is a gerrit-submit alias "
+        "(420, 410, master, 632, 萤石5部, RTT-A2); ask the user when it is not clear."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "string", "description": "A git repository project on the bridge (not a whole repo workspace)."},
+            "title": {"type": "string", "description": "Short task name shown in notifications."},
+            "requirement": {"type": "string", "description": "The user's original requirement, verbatim."},
+            "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "One checkable criterion per item."},
+            "branch": {"type": "string", "description": "gerrit-submit branch alias, e.g. 420 or master."},
+            "jira_id": {"type": "string"},
+            "instructions": {"type": "string", "description": "Extra guidance for the developer."},
+            "rework_policy": {"type": "string", "enum": ["confirm", "auto"],
+                              "description": "confirm (default): ask the user before each rework; auto: rework within the limit."},
+            "max_rework_rounds": {"type": "integer"},
+            "idempotency_key": {"type": "string", "description": "Reuse to retry this exact submission safely."},
+            **_RUN_PROPS,
+        },
+        "required": ["project_id", "requirement", "acceptance_criteria", "branch"],
+    },
+}
+
+WORKFLOW_GET_SCHEMA = {
+    "name": "claude_workflow_get",
+    "description": (
+        "Read a workflow: business status, current revision, Gerrit link, tasks, review reports, decisions and "
+        "'notification', a ready-made message for the user. When the user should be told something, send "
+        "'notification' as it is. latest_report holds the full review report when the user asks for it."
+    ),
+    "parameters": {"type": "object", "properties": {"workflow_id": {"type": "string"}}, "required": ["workflow_id"]},
+}
+
+WORKFLOW_LIST_SCHEMA = {
+    "name": "claude_workflow_list",
+    "description": "List develop/review workflows, newest first.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Comma-separated business statuses."},
+            "this_session_only": {"type": "boolean", "description": "Defaults to true."},
+            "limit": {"type": "integer"},
+        },
+    },
+}
+
+WORKFLOW_REVIEW_SCHEMA = {
+    "name": "claude_workflow_review",
+    "description": (
+        "Start the independent review of the workflow's current revision: a new Claude Code session in its own "
+        "worktree that only reads and tests. Only valid in awaiting_review; repeating it returns the same review."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_id": {"type": "string"},
+            "instructions": {"type": "string", "description": "Extra focus for the reviewer."},
+            **_RUN_PROPS,
+        },
+        "required": ["workflow_id"],
+    },
+}
+
+WORKFLOW_REWORK_SCHEMA = {
+    "name": "claude_workflow_rework",
+    "description": (
+        "Send the review findings back to the developer's session to amend the commit and push a new patch set. "
+        "source='user' only when the user asked for it in this conversation; source='auto' only after a "
+        "changes_requested review when the workflow's rework_policy is auto. Over the limit the workflow moves "
+        "to needs_human instead. rebase_only=true rebases onto the latest target branch without other changes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_id": {"type": "string"},
+            "source": {"type": "string", "enum": ["user", "auto"]},
+            "instructions": {"type": "string", "description": "What the user wants changed, if they said."},
+            "rebase_only": {"type": "boolean"},
+            **_RUN_PROPS,
+        },
+        "required": ["workflow_id", "source"],
+    },
+}
+
+WORKFLOW_DECIDE_SCHEMA = {
+    "name": "claude_workflow_decide",
+    "description": (
+        "Record the user's decision. approve: the user approves the reviewed patch set and will merge it in Gerrit "
+        "themselves. reject: the user refuses to merge. rereview: review again (optionally a revision the user pushed "
+        "outside the bridge, with fetch_ref such as refs/changes/45/12345/3). abandon: stop the workflow. Only record "
+        "what the user actually said; nothing is done on Gerrit."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_id": {"type": "string"},
+            "decision": {"type": "string", "enum": ["approve", "reject", "rereview", "abandon"]},
+            "source_ref": {"type": "string", "description": "Id of the user's message; reuse it when retrying."},
+            "note": {"type": "string"},
+            "revision": {"type": "string"},
+            "fetch_ref": {"type": "string"},
+        },
+        "required": ["workflow_id", "decision"],
+    },
+}
+
+WORKFLOW_MERGE_CHECK_SCHEMA = {
+    "name": "claude_workflow_merge_check",
+    "description": (
+        "Check with git whether the change has reached the target branch (after the user merged it in Gerrit). "
+        "Returns at once; this conversation is woken with the result."
+    ),
+    "parameters": {"type": "object", "properties": {"workflow_id": {"type": "string"}}, "required": ["workflow_id"]},
+}
+
+
+def _workflow_path(workflow_id: Any, suffix: str = "") -> str:
+    if not isinstance(workflow_id, str) or not workflow_id:
+        raise BridgeError("workflow_id is required")
+    return f"/v1/workflows/{urllib.parse.quote(workflow_id, safe='')}{suffix}"
+
+
+def _pick(args: dict, keys: tuple[str, ...]) -> dict:
+    return {k: args[k] for k in keys if args.get(k) is not None}
 
 def _brief(task: dict) -> dict:
     keys = ("task_id", "title", "project_id", "status", "kind", "last_action", "last_event_at",
@@ -317,11 +455,81 @@ def register(ctx: Any) -> None:
         reply = _api("POST", _task_path(args.get("task_id"), "/cancel"), {})
         return {"success": True, **reply}
 
+    def _session_fields(kwargs: dict) -> dict:
+        session_id = kwargs.get("session_id") or ""
+        waker.track_session(session_id)
+        fields = {"hermes_session_id": session_id} if session_id else {}
+        session_key = _session_key()
+        if session_key:
+            fields["hermes_session_key"] = session_key
+        return fields
+
+    run_keys = tuple(_RUN_PROPS)
+
+    @_tool
+    def workflow_start(args: dict, **kwargs: Any) -> dict:
+        body = _pick(args, ("project_id", "title", "requirement", "acceptance_criteria", "branch", "jira_id",
+                            "instructions", "rework_policy", "max_rework_rounds", *run_keys))
+        body.update(_session_fields(kwargs))
+        key = args.get("idempotency_key") or f"plugin-{uuid.uuid4().hex}"
+        reply = _api("POST", "/v1/workflows", body, {"Idempotency-Key": key})
+        return {
+            "success": True, **reply, "idempotency_key": key,
+            "note": "The developer runs in the background. This conversation is woken at each step; do not poll.",
+        }
+
+    @_tool
+    def workflow_get(args: dict, **kwargs: Any) -> dict:
+        waker.track_session(kwargs.get("session_id") or "")
+        return {"success": True, "workflow": _api("GET", _workflow_path(args.get("workflow_id")))}
+
+    @_tool
+    def workflow_list(args: dict, **kwargs: Any) -> dict:
+        query: dict[str, Any] = {"limit": args.get("limit", 20)}
+        if args.get("status"):
+            query["status"] = args["status"]
+        session_id = kwargs.get("session_id") or ""
+        if args.get("this_session_only", True) and session_id:
+            query["hermes_session_id"] = session_id
+        return {"success": True, **_api("GET", "/v1/workflows?" + urllib.parse.urlencode(query))}
+
+    @_tool
+    def workflow_review(args: dict, **kwargs: Any) -> dict:
+        waker.track_session(kwargs.get("session_id") or "")
+        reply = _api("POST", _workflow_path(args.get("workflow_id"), "/review"), _pick(args, ("instructions", *run_keys)))
+        return {"success": True, **reply}
+
+    @_tool
+    def workflow_rework(args: dict, **kwargs: Any) -> dict:
+        waker.track_session(kwargs.get("session_id") or "")
+        body = _pick(args, ("source", "instructions", "rebase_only", *run_keys))
+        return {"success": True, **_api("POST", _workflow_path(args.get("workflow_id"), "/rework"), body)}
+
+    @_tool
+    def workflow_decide(args: dict, **kwargs: Any) -> dict:
+        waker.track_session(kwargs.get("session_id") or "")
+        body = _pick(args, ("decision", "note", "revision", "fetch_ref"))
+        body["source"] = "user"
+        body["source_ref"] = args.get("source_ref") or f"plugin-{uuid.uuid4().hex}"
+        return {"success": True, **_api("POST", _workflow_path(args.get("workflow_id"), "/decisions"), body)}
+
+    @_tool
+    def workflow_merge_check(args: dict, **kwargs: Any) -> dict:
+        waker.track_session(kwargs.get("session_id") or "")
+        return {"success": True, **_api("POST", _workflow_path(args.get("workflow_id"), "/merge-check"), {})}
+
     for name, schema, handler in (
         ("claude_task_start", START_SCHEMA, start),
         ("claude_task_get", GET_SCHEMA, get),
         ("claude_task_list", LIST_SCHEMA, list_tasks),
         ("claude_task_cancel", CANCEL_SCHEMA, cancel),
+        ("claude_workflow_start", WORKFLOW_START_SCHEMA, workflow_start),
+        ("claude_workflow_get", WORKFLOW_GET_SCHEMA, workflow_get),
+        ("claude_workflow_list", WORKFLOW_LIST_SCHEMA, workflow_list),
+        ("claude_workflow_review", WORKFLOW_REVIEW_SCHEMA, workflow_review),
+        ("claude_workflow_rework", WORKFLOW_REWORK_SCHEMA, workflow_rework),
+        ("claude_workflow_decide", WORKFLOW_DECIDE_SCHEMA, workflow_decide),
+        ("claude_workflow_merge_check", WORKFLOW_MERGE_CHECK_SCHEMA, workflow_merge_check),
     ):
         ctx.register_tool(name=name, toolset="claude_bridge", schema=schema, handler=handler)
 

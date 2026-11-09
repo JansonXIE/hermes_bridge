@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import procs, stream_parser, workspace
+from . import workflow as wfm
 from .config import NESTED_SESSION_ENV, Config, Project
 from .dispatcher import Dispatcher
 from .redact import Redactor
@@ -55,7 +56,19 @@ def build_child_env(config: Config, project: Project, task: dict, attempt: dict,
     return env
 
 
-def build_argv(config: Config, project: Project, task: dict, resume_session: Optional[str]) -> list[str]:
+def role_disallowed_tools(config: Config, task: dict, wf: Optional[dict]) -> list[str]:
+    """Extra deny rules per workflow role. They narrow what Claude may do; the bridge still checks afterwards."""
+    if not wf:
+        return []
+    if task["role"] == wfm.REVIEW:
+        return ["Edit", "NotebookEdit", "Bash(git push:*)", "Bash(git commit:*)"]
+    remote, target = config.workflow_remote, wf["target_branch"]
+    return [f"Bash(git push {remote} HEAD:{target}:*)", f"Bash(git push {remote} HEAD:refs/heads/:*)",
+            f"Bash(git push {remote} {target}:*)"]
+
+
+def build_argv(config: Config, project: Project, task: dict, resume_session: Optional[str],
+               extra_disallowed: Optional[list[str]] = None) -> list[str]:
     """Argument array for the installed CLI. The prompt is passed on stdin, never on the command line."""
     argv = [*config.claude_command, "-p", "--output-format", "stream-json", "--verbose"]
     if config.include_partial_messages:
@@ -63,8 +76,9 @@ def build_argv(config: Config, project: Project, task: dict, resume_session: Opt
     argv += ["--permission-mode", project.permission_mode, "--name", task["id"]]
     if project.allowed_tools:
         argv += ["--allowedTools", ",".join(project.allowed_tools)]
-    if project.disallowed_tools:
-        argv += ["--disallowedTools", ",".join(project.disallowed_tools)]
+    disallowed = [*project.disallowed_tools, *(t for t in extra_disallowed or () if t not in project.disallowed_tools)]
+    if disallowed:
+        argv += ["--disallowedTools", ",".join(disallowed)]
     model = task["model"] or project.model
     if model:
         argv += ["--model", model]
@@ -156,6 +170,10 @@ class AttemptRunner(threading.Thread):
         if source and not (source["claude_session_id"] and source["workdir"] and Path(source["workdir"]).is_dir()):
             self._finish(FAILED, error_code="continue_unavailable", error_message="source task has no resumable session or worktree")
             return False
+        wf = self.store.get_workflow(task["workflow_id"]) if task["workflow_id"] else None
+        if wf and self.project.isolation != "worktree":
+            self._finish(FAILED, error_code="project_unavailable", error_message="workflows need a worktree project")
+            return False
 
         run_dir = self.config.runs_dir / self.task_id
         workspace.ensure_private(self.config.runs_dir)
@@ -166,7 +184,13 @@ class AttemptRunner(threading.Thread):
             if source:
                 ws = workspace.Workspace(Path(source["workdir"]), source["branch"], source["base_commit"])
             else:
-                ws = workspace.prepare(self.config, self.project, task, self._dependency_branches(task))
+                start_point = self._workflow_start_point(task, wf) if wf else None
+                ws = workspace.prepare(self.config, self.project, task, self._dependency_branches(task), start_point)
+            if wf:
+                workspace.ignore_bridge_dir(ws.workdir)
+                # A hand-off file left by an earlier round or attempt must not pass for this one.
+                for name in (wfm.EVIDENCE_FILE, wfm.REPORT_FILE):
+                    (ws.workdir / name).unlink(missing_ok=True)
         except workspace.WorkspaceError as exc:
             self._finish(FAILED, error_code=exc.code, error_message=self.redactor.text(str(exc)))
             return False
@@ -180,7 +204,8 @@ class AttemptRunner(threading.Thread):
         task = self._task()
         attempt = self.store.get_attempt(self.attempt_id)
         env = build_child_env(self.config, self.project, task, attempt, run_dir)
-        argv = build_argv(self.config, self.project, task, source["claude_session_id"] if source else None)
+        argv = build_argv(self.config, self.project, task, source["claude_session_id"] if source else None,
+                          role_disallowed_tools(self.config, task, wf))
 
         self.store.mark_spawn_intent(self.attempt_id, self.token, self.stdout_path, self.stderr_path)
         self.spawn_intent_at = time.time()
@@ -198,6 +223,46 @@ class AttemptRunner(threading.Thread):
         self.boot = procs.boot_id()
         self.store.mark_spawned(self.attempt_id, self.token, self.task_id, self.pid, self.start_time or 0, self.boot)
         return True
+
+    def _with_lease(self, fn, *args):
+        """Run a slow step (network git) while keeping the lease alive, so no one takes the attempt over."""
+        box: dict = {}
+
+        def call() -> None:
+            try:
+                box["value"] = fn(*args)
+            except BaseException as exc:  # re-raised in this thread
+                box["error"] = exc
+
+        thread = threading.Thread(target=call, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            thread.join(self.config.tick_seconds)
+            self._maybe_renew(time.time())
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def _workflow_start_point(self, task: dict, wf: dict) -> Optional[str]:
+        if task["role"] == wfm.REVIEW:
+            subject = json.loads(task["review_subject"])
+            revision = subject["revision"]
+            if not workspace.has_commit(self.project.path, revision) and subject.get("fetch_ref"):
+                self._with_lease(workspace.fetch, self.config, self.project, subject["fetch_ref"])
+            if not workspace.has_commit(self.project.path, revision):
+                raise workspace.WorkspaceError("revision_unavailable", f"revision {revision} is not in the repository")
+            return revision
+        # Develop from the latest target branch; fall back to what the repository already has.
+        target = wf["target_branch"]
+        try:
+            fetched = self._with_lease(workspace.fetch, self.config, self.project, target)
+            source = f"fetched {self.config.workflow_remote}/{target}"
+        except workspace.WorkspaceError as exc:
+            tracking = f"refs/remotes/{self.config.workflow_remote}/{target}"
+            fetched = tracking if workspace.has_commit(self.project.path, tracking) else None
+            source = f"fetch failed ({self.redactor.text(str(exc))[:200]}); using {fetched or self.project.base_ref}"
+        self.store.add_attempt_event(self.attempt_id, self.token, self.task_id, "workflow.base", {"source": source})
+        return fetched
 
     def _dependency_branches(self, task: dict) -> list[str]:
         deps = (self.store.get_task(d) for d in json.loads(task["depends_on"]))
@@ -455,9 +520,102 @@ class AttemptRunner(threading.Thread):
         if not task.get("workdir") or self.project is None:
             return None
         try:
-            return workspace.collect_changes(task["workdir"], task["branch"], task["base_commit"], self.project, self.task_id)
+            return workspace.collect_changes(task["workdir"], task["branch"], task["base_commit"], self.project, self.task_id,
+                                             snapshot=not task.get("workflow_id"))
         except workspace.WorkspaceError as exc:
             return {"error": self.redactor.text(str(exc))}
+
+    def _attempt_logs(self, task: dict) -> list[Path]:
+        run_dir = Path(task["run_dir"]) if task.get("run_dir") else None
+        return sorted(run_dir.glob("attempt-*/stdout.jsonl")) if run_dir else []
+
+    def _verify_dev(self, task: dict, wf: dict) -> dict:
+        """Check the push with local git and the worker's own tool log; Gerrit's API is never queried."""
+        workdir = Path(task["workdir"])
+        problems: list[str] = []
+        data, err = wfm.read_json_file(workdir / wfm.EVIDENCE_FILE)
+        if err:
+            problems.append(f"evidence_{err}")
+        evidence = wfm.normalize_evidence(data)
+        if evidence["blocked_reason"]:
+            problems.append("evidence_blocked")
+        head = workspace.head(workdir)
+        if evidence["revision"] and not wfm.same_revision(evidence["revision"], head):
+            problems.append("revision_mismatch")
+        change_id = wfm.change_id_of(workspace.commit_message(workdir))
+        if not change_id:
+            problems.append("change_id_missing")
+        elif evidence["change_id"] and evidence["change_id"] != change_id:
+            problems.append("change_id_mismatch")
+        elif task["role"] == wfm.REWORK and wf["change_id"] and change_id != wf["change_id"]:
+            problems.append("change_id_changed")
+        count = workspace.commit_count(workdir, task["base_commit"]) if task["base_commit"] else None
+        if count == 0:
+            problems.append("no_commit")
+        elif count and count > 1:
+            problems.append("multiple_commits")
+
+        expected = f"refs/for/{wf['target_branch']}"
+        pushes = wfm.scan_pushes(self._attempt_logs(task))
+        good = [p for p in pushes if p["ok"] and any(d == expected or d.startswith(expected + "%") for d in p["destinations"])]
+        direct = [p for p in pushes if any(not d.startswith("refs/for/") for d in p["destinations"])]
+        if direct:
+            problems.append("direct_push_detected")
+        if not good:
+            problems.append("push_not_found")
+        url, number = wfm.extract_gerrit_url(*(p["output"] for p in reversed(good)), evidence["push_output"], evidence["gerrit_url"])
+
+        try:
+            if count == 0:
+                raise workspace.WorkspaceError("no_commit", "nothing new to look for on the target branch")
+            fetched = self._with_lease(workspace.fetch, self.config, self.project, wf["target_branch"])
+            on_target = workspace.is_ancestor(self.project.path, head, fetched) or (
+                change_id and workspace.find_change(self.project.path, change_id, fetched, task["base_commit"]))
+            target_check = "contains_change" if on_target else "clean"
+            if on_target:
+                problems.append("target_contains_change")
+        except workspace.WorkspaceError as exc:
+            target_check = f"unchecked: {self.redactor.text(str(exc))[:200]}"
+
+        gerrit = {
+            "revision": head, "change_id": change_id, "pushed_ref": expected, "gerrit_url": url,
+            "change_number": number or evidence["change_number"], "patchset": evidence["patchset"],
+            "push_commands": [self.redactor.text(p["command"])[:300] for p in pushes][:20],
+            "target_check": target_check, "uncommitted_files": workspace.tracked_changes(workdir)[:50],
+            "verified_by": "local_git",
+        }
+        evidence_view = {k: self.redactor.value(evidence[k]) for k in
+                         ("self_tests", "regression_scope", "known_risks", "blocked_reason")}
+        return {"gerrit": gerrit, "evidence": evidence_view, "problems": problems}
+
+    def _verify_review(self, task: dict, wf: dict) -> dict:
+        """Bind the report to the reviewed revision and make sure the reviewer only read."""
+        workdir = Path(task["workdir"])
+        subject = json.loads(task["review_subject"])
+        invalid = None
+        if not wfm.same_revision(workspace.head(workdir), subject["revision"]):
+            invalid = "HEAD moved off the revision under review"
+        elif workspace.tracked_changes(workdir):
+            invalid = "the review modified tracked files: " + ", ".join(workspace.tracked_changes(workdir)[:10])
+        elif wfm.scan_pushes(self._attempt_logs(task)):
+            invalid = "the review ran git push"
+        source = workdir / wfm.REPORT_FILE
+        data, err = wfm.read_json_file(source)
+        report = None
+        if err:
+            invalid = invalid or f"review report {err}"
+        else:
+            report, reason = wfm.validate_report(data, subject, json.loads(wf["criteria"]))
+            invalid = invalid or reason
+        report_path = None
+        if source.is_file() and not err:
+            target = Path(task["run_dir"]) / f"attempt-{self.number}" / "review-report.json"
+            target.write_bytes(source.read_bytes())
+            os.chmod(target, 0o600)
+            report_path = str(target)
+        if report is not None:
+            report = self.redactor.value(report)
+        return {"report": report, "invalid_reason": invalid, "report_path": report_path}
 
     def _conclude(self, exit_code: Optional[int], exit_signal: Optional[int]) -> None:
         """Decide the final state from the result event and exit status together."""
@@ -482,13 +640,31 @@ class AttemptRunner(threading.Thread):
                          error_message=errors or f"Claude Code reported failure (exit_code={exit_code})", **exit_fields)
             return
 
+        outcome = None
+        wf = self.store.get_workflow(task["workflow_id"]) if task["workflow_id"] else None
+        if wf:
+            try:
+                if task["role"] == wfm.REVIEW:
+                    outcome = self._verify_review(task, wf)
+                else:
+                    outcome = self._verify_dev(task, wf)
+                    changes = {**(changes or {}), "gerrit": outcome["gerrit"], "evidence": outcome["evidence"],
+                               "problems": outcome["problems"]}
+            except workspace.WorkspaceError as exc:
+                reason = f"verification failed: {self.redactor.text(str(exc))[:300]}"
+                outcome = {"problems": ["verification_error"], "invalid_reason": reason}
+
         # CLI success is not acceptance: the project's own check gives the verdict.
-        acceptance = self._run_acceptance(task)
+        if task["role"] == wfm.REVIEW:
+            acceptance = {"status": "not_run", "reason": "review tasks do not run verify_command"}
+        else:
+            acceptance = self._run_acceptance(task)
         latest = self._task()
         if latest["cancel_requested_at"]:
             self._finish(CANCELLED, result=result, changes=changes, acceptance=acceptance, **exit_fields)
             return
-        self._finish(SUCCEEDED, result=result, changes=changes, acceptance=acceptance, **exit_fields)
+        self._finish(SUCCEEDED, result=result, changes=changes, acceptance=acceptance, workflow_outcome=outcome,
+                     **exit_fields)
 
     def _run_acceptance(self, task: dict) -> dict:
         command = self.project.verify_command if self.project else ()
@@ -548,6 +724,7 @@ class Worker:
         self.runners: list[AttemptRunner] = []
         self.dispatcher = Dispatcher(config, self.store)
         self._last_maintenance = 0.0
+        self._merge_checker: Optional[threading.Thread] = None
 
     def request_shutdown(self, *_: object) -> None:
         self.shutting_down.set()
@@ -583,6 +760,9 @@ class Worker:
             if claimed is None:
                 break
             self._launch(*claimed)
+        if (self._merge_checker is None or not self._merge_checker.is_alive()) and self.store.pending_merge_checks():
+            self._merge_checker = threading.Thread(target=self._run_merge_checks, name="merge-check", daemon=True)
+            self._merge_checker.start()
         if now - self._last_maintenance > 3600:
             self._last_maintenance = now
             self.store.prune_events(now - self.config.event_retention_days * 86400)
@@ -594,6 +774,27 @@ class Worker:
             if taken:
                 log.warning("task %s: lease expired, recovering attempt %s", attempt["task_id"], attempt["id"])
                 self._launch(*taken, recovering=True)
+
+    def _run_merge_checks(self) -> None:
+        """Look for each workflow's Change-Id on the fetched target branch; network git stays off the main loop."""
+        store = Store(self.config.db_path)  # connections are per thread
+        for wf in store.pending_merge_checks():
+            merged, error = None, None
+            project = self.config.projects.get(wf["project_id"])
+            try:
+                if project is None or project.path is None:
+                    raise workspace.WorkspaceError("project_unavailable", "project removed from configuration")
+                fetched = workspace.fetch(self.config, project, wf["target_branch"])
+                merged = workspace.find_change(project.path, wf["change_id"], fetched, wf["base_commit"])
+                if not merged and wf["current_revision"] and workspace.is_ancestor(project.path, wf["current_revision"], fetched):
+                    merged = wf["current_revision"]
+            except workspace.WorkspaceError as exc:
+                error = self.redactor.text(str(exc))[:500]
+            except Exception as exc:
+                log.exception("merge check for %s failed", wf["id"])
+                error = f"internal error: {type(exc).__name__}"
+            store.record_merge_check(wf["id"], wf["merge_check_requested_at"], merged, error)
+            log.info("workflow %s merge check: merged=%s error=%s", wf["id"], merged, error)
 
     def _launch(self, task: dict, attempt: dict, recovering: bool = False) -> None:
         runner = AttemptRunner(self, task, attempt, recovering=recovering)
